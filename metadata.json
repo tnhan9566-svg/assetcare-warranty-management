@@ -1,0 +1,6 @@
+{
+  "name": "AssetCare – Quản Lý Thiết Bị & Bảo Hành",
+  "description": "Hệ thống quản lý tài sản cá nhân, thiết bị điện tử, theo dõi hạn bảo hành tự động, lưu trữ hóa đơn và lịch sử sửa chữa.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

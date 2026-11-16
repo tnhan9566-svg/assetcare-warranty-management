@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import {
   Asset,
   Category,
@@ -95,10 +95,23 @@ const STORAGE_KEYS = {
   LOGS: 'assetcare_activity_logs',
 };
 
+async function apiCall(url: string, method: string, body?: unknown): Promise<void> {
+  try {
+    await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (err) {
+    console.error(`[AssetCare API] ${method} ${url} failed:`, err);
+  }
+}
+
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // Load from localStorage or use initial data
+  const dbConnectedRef = useRef<boolean>(false);
+
   const [users, setUsers] = useState<User[]>(() => {
     const saved = localStorage.getItem(STORAGE_KEYS.USERS);
     return saved ? JSON.parse(saved) : INITIAL_USERS;
@@ -148,6 +161,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
 
+  // Hydrate from SQL Server backend if DB_ENABLED=true and connected
+  useEffect(() => {
+    let active = true;
+    fetch('/api/bootstrap')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!active || !data || !data.dbConnected) return;
+        dbConnectedRef.current = true;
+        if (Array.isArray(data.users) && data.users.length > 0) setUsers(data.users);
+        if (Array.isArray(data.categories)) setCategories(data.categories);
+        if (Array.isArray(data.assets)) setAssets(data.assets);
+        if (Array.isArray(data.warranties)) setWarranties(data.warranties);
+        if (Array.isArray(data.documents)) setDocuments(data.documents);
+        if (Array.isArray(data.repairs)) setRepairs(data.repairs);
+        if (Array.isArray(data.notifications)) setNotifications(data.notifications);
+        if (Array.isArray(data.activityLogs)) setActivityLogs(data.activityLogs);
+      })
+      .catch(() => {
+        // Fallback silently to localStorage mode when running standalone
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   // Sync to localStorage
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
@@ -189,16 +227,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const currentUser = users.find((u) => u.id === currentUserId) || users[0];
 
   // Helper log activity
-  const logActivity = (action: string, description: string) => {
+  const logActivity = (action: string, description: string, actor?: User) => {
+    const u = actor || currentUser;
     const newLog: ActivityLog = {
       id: generateId('log'),
-      userId: currentUser.id,
-      userName: currentUser.fullName,
+      userId: u.id,
+      userName: u.fullName,
       action,
       description,
       createdAt: new Date().toISOString(),
     };
     setActivityLogs((prev) => [newLog, ...prev]);
+    if (dbConnectedRef.current) {
+      void apiCall('/api/logs', 'POST', newLog);
+    }
   };
 
   // User-scoped assets vs Admin assets
@@ -209,7 +251,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const user = users.find((u) => u.id === userId);
     if (user) {
       setCurrentUserId(userId);
-      logActivity('Đổi người dùng', `Chuyển sang tài khoản ${user.fullName} (${user.role})`);
+      logActivity('Đổi người dùng', `Chuyển sang tài khoản ${user.fullName} (${user.role})`, user);
     }
   };
 
@@ -217,13 +259,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const found = users.find((u) => u.email.toLowerCase() === email.toLowerCase());
     if (found) {
       setCurrentUserId(found.id);
-      logActivity('Đăng nhập', `Đăng nhập thành công với email ${email}`);
+      logActivity('Đăng nhập', `Đăng nhập thành công với email ${email}`, found);
       return true;
     }
     return false;
   };
 
-  const register = (fullName: string, email: string) => {
+  const register = (fullName: string, email: string, password = '123456') => {
     if (users.some((u) => u.email.toLowerCase() === email.toLowerCase())) {
       return false;
     }
@@ -239,7 +281,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
     setUsers((prev) => [...prev, newUser]);
     setCurrentUserId(newUser.id);
-    logActivity('Đăng ký tài khoản', `Người dùng mới: ${fullName} (${email})`);
+    if (dbConnectedRef.current) {
+      void apiCall('/api/auth/register', 'POST', { ...newUser, password });
+    }
+    logActivity('Đăng ký tài khoản', `Người dùng mới: ${fullName} (${email})`, newUser);
     return true;
   };
 
@@ -247,7 +292,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setUsers((prev) =>
       prev.map((u) => (u.id === currentUser.id ? { ...u, ...data } : u))
     );
-    logActivity('Cập nhật hồ sơ', `Người dùng cập nhật thông tin cá nhân`);
+    if (dbConnectedRef.current) {
+      void apiCall(`/api/users/${currentUser.id}`, 'PUT', data);
+    }
+    logActivity('Cập nhật hồ sơ', 'Người dùng cập nhật thông tin cá nhân');
   };
 
   // Add Asset
@@ -274,11 +322,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       createdAt: nowIso,
     };
 
-    setAssets((prev) => [newAsset, ...prev]);
-    setWarranties((prev) => [newWarranty, ...prev]);
-
+    let createdDoc: DocumentItem | null = null;
     if (initialDoc && initialDoc.fileUrl) {
-      const newDoc: DocumentItem = {
+      createdDoc = {
         id: generateId('doc'),
         assetId: assetId,
         name: initialDoc.name || 'Hóa đơn mua hàng',
@@ -288,13 +334,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         uploadedAt: nowIso,
         note: initialDoc.note,
       };
-      setDocuments((prev) => [newDoc, ...prev]);
     }
 
-    // Auto-check warranty notification
+    let createdNotif: NotificationItem | null = null;
     const warCalc = calculateWarranty(newWarranty.startDate, newWarranty.endDate);
     if (warCalc.daysRemaining <= 30 && warCalc.daysRemaining >= 0) {
-      const newNotif: NotificationItem = {
+      createdNotif = {
         id: generateId('notif'),
         userId: currentUser.id,
         assetId: assetId,
@@ -305,7 +350,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         isRead: false,
         createdAt: nowIso,
       };
-      setNotifications((prev) => [newNotif, ...prev]);
+    }
+
+    setAssets((prev) => [newAsset, ...prev]);
+    setWarranties((prev) => [newWarranty, ...prev]);
+    if (createdDoc) setDocuments((prev) => [createdDoc!, ...prev]);
+    if (createdNotif) setNotifications((prev) => [createdNotif!, ...prev]);
+
+    if (dbConnectedRef.current) {
+      void apiCall('/api/assets', 'POST', {
+        asset: newAsset,
+        warranty: newWarranty,
+        document: createdDoc,
+        notification: createdNotif,
+      });
     }
 
     logActivity('Thêm tài sản', `Đã thêm tài sản mới: ${newAsset.name} (${newAsset.brand})`);
@@ -324,6 +382,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       );
     }
 
+    if (dbConnectedRef.current) {
+      void apiCall(`/api/assets/${id}`, 'PUT', { assetData, warrantyData });
+    }
+
     logActivity('Cập nhật tài sản', `Đã chỉnh sửa thông tin tài sản ID: ${id}`);
   };
 
@@ -339,6 +401,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSelectedAssetId(null);
     }
 
+    if (dbConnectedRef.current) {
+      void apiCall(`/api/assets/${id}`, 'DELETE');
+    }
+
     logActivity('Xóa tài sản', `Đã xóa tài sản: ${target?.name || id}`);
   };
 
@@ -350,12 +416,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       uploadedAt: new Date().toISOString(),
     };
     setDocuments((prev) => [newDoc, ...prev]);
+    if (dbConnectedRef.current) {
+      void apiCall('/api/documents', 'POST', newDoc);
+    }
     logActivity('Tải lên tài liệu', `Đã thêm tài liệu: ${newDoc.name}`);
   };
 
   const deleteDocument = (id: string) => {
     const target = documents.find((d) => d.id === id);
     setDocuments((prev) => prev.filter((d) => d.id !== id));
+    if (dbConnectedRef.current) {
+      void apiCall(`/api/documents/${id}`, 'DELETE');
+    }
     logActivity('Xóa tài liệu', `Đã xóa tài liệu: ${target?.name || id}`);
   };
 
@@ -367,6 +439,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       createdAt: new Date().toISOString(),
     };
     setRepairs((prev) => [newRepair, ...prev]);
+    if (dbConnectedRef.current) {
+      void apiCall('/api/repairs', 'POST', newRepair);
+    }
 
     const asset = assets.find((a) => a.id === repair.assetId);
     logActivity(
@@ -377,7 +452,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const deleteRepair = (id: string) => {
     setRepairs((prev) => prev.filter((r) => r.id !== id));
-    logActivity('Xóa lịch sử sửa chữa', `Đã xóa hồ sơ sửa chữa`);
+    if (dbConnectedRef.current) {
+      void apiCall(`/api/repairs/${id}`, 'DELETE');
+    }
+    logActivity('Xóa lịch sử sửa chữa', 'Đã xóa hồ sơ sửa chữa');
   };
 
   // Notification CRUD
@@ -385,12 +463,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setNotifications((prev) =>
       prev.map((n) => (n.id === id ? { ...n, isRead: true } : n))
     );
+    if (dbConnectedRef.current) {
+      void apiCall(`/api/notifications/${id}/read`, 'PUT');
+    }
   };
 
   const markAllNotificationsRead = () => {
     setNotifications((prev) =>
       prev.map((n) => (n.userId === currentUser.id ? { ...n, isRead: true } : n))
     );
+    if (dbConnectedRef.current) {
+      void apiCall('/api/notifications/read-all', 'PUT', { userId: currentUser.id });
+    }
   };
 
   // Category CRUD
@@ -400,6 +484,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       id: generateId('cat'),
     };
     setCategories((prev) => [...prev, newCat]);
+    if (dbConnectedRef.current) {
+      void apiCall('/api/categories', 'POST', newCat);
+    }
     logActivity('Thêm danh mục', `Quản trị viên thêm danh mục: ${newCat.name}`);
   };
 
@@ -407,12 +494,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCategories((prev) =>
       prev.map((c) => (c.id === id ? { ...c, ...data } : c))
     );
-    logActivity('Cập nhật danh mục', `Chỉnh sửa danh mục`);
+    if (dbConnectedRef.current) {
+      void apiCall(`/api/categories/${id}`, 'PUT', data);
+    }
+    logActivity('Cập nhật danh mục', 'Chỉnh sửa danh mục');
   };
 
   const deleteCategory = (id: string) => {
     setCategories((prev) => prev.filter((c) => c.id !== id));
-    logActivity('Xóa danh mục', `Đã xóa danh mục`);
+    if (dbConnectedRef.current) {
+      void apiCall(`/api/categories/${id}`, 'DELETE');
+    }
+    logActivity('Xóa danh mục', 'Đã xóa danh mục');
   };
 
   // Admin user controls
@@ -420,6 +513,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setUsers((prev) =>
       prev.map((u) => (u.id === userId ? { ...u, status } : u))
     );
+    if (dbConnectedRef.current) {
+      void apiCall(`/api/users/${userId}`, 'PUT', { status });
+    }
     logActivity('Cập nhật người dùng', `Thay đổi trạng thái tài khoản sang ${status}`);
   };
 
@@ -427,6 +523,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setUsers((prev) =>
       prev.map((u) => (u.id === userId ? { ...u, role } : u))
     );
+    if (dbConnectedRef.current) {
+      void apiCall(`/api/users/${userId}`, 'PUT', { role });
+    }
     logActivity('Phân quyền người dùng', `Cập nhật quyền hạn sang ${role}`);
   };
 
